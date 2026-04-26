@@ -72,17 +72,17 @@ Unsupported upstream props:
 | `expires` | Prefer `cacheControl` for deployment-time cache behavior. |
 | `serverSideEncryptionCustomerAlgorithm` | SSE-C is intentionally not implemented; use SSE-S3 or SSE-KMS. |
 | `signContent` | The provider uses AWS SDK calls directly, not the upstream AWS CLI upload path. |
-| `useEfs` | Increase `ephemeralStorageSize` instead; the provider works from Lambda `/tmp`. |
+| `useEfs` | Increase `ephemeralStorageSize` instead; large source archives can fall back to Lambda `/tmp`. |
 
 ## How It Works
 
-For `extract=true`, the provider streams each source zip from S3 to a temporary file in Lambda `/tmp`, walks the archive entries, applies filters, and builds the deployment plan from the archive contents. It does not extract the whole archive to a working directory.
+For `extract=true`, the provider keeps source zips up to 256 MiB in memory and falls back to a temporary file in Lambda `/tmp` for larger or unknown-size archives. It walks the archive entries, applies filters, and builds the deployment plan from the archive contents. It does not extract the whole archive to a working directory.
 
 For `extract=false`, each source object is copied directly with S3 `CopyObject`.
 
 Before uploading or copying, the provider lists the destination prefix. Destination keys are used for `prune=true`; size, checksum metadata, and `ETag` values are used to skip unchanged objects.
 
-For marker-free zip entries, the provider compares zip entry CRC32 plus uncompressed size with S3 `ChecksumCRC32` plus object size when that checksum metadata is available. Changed entries are streamed to S3 with `x-amz-checksum-crc32`, so S3 validates the upload and stores checksum metadata for later deployments. If checksum metadata cannot be used, the provider falls back to the `ETag` comparison path.
+For marker-free zip entries at least 8 MiB, the provider compares zip entry CRC32 plus uncompressed size with S3 `ChecksumCRC32` plus object size when that checksum metadata is available. Smaller entries use the `ETag` comparison path because the benchmarked `HeadObject` round trip was more expensive than local hashing. Changed entries are uploaded with `x-amz-checksum-crc32`, so S3 validates the upload and stores checksum metadata for later deployments.
 
 CloudFront invalidation is created after S3 changes when `distribution` is provided. If `distributionPaths` is omitted, the default path is the destination prefix plus `*`, for example `/site/*`.
 
@@ -94,9 +94,28 @@ When CRC32 cannot be used, the fallback optimization depends on S3 `ETag` values
 
 Uploads or copies may not be skipped correctly for metadata-only changes, multipart objects, SSE-KMS or SSE-C objects, or any case where neither full-object CRC32 nor MD5-like `ETag` metadata is available.
 
-Zip entries with deploy-time marker replacements are fully materialized in memory after replacement so the final bytes can be hashed and uploaded. Plain zip entries are read and uploaded in chunks.
+Zip entries with deploy-time marker replacements are fully materialized in memory after replacement so the final bytes can be hashed and uploaded. Plain zip entries are read and uploaded in chunks, except the ETag fallback path caches decompressed entries up to 32 MiB to avoid decompressing the same changed entry twice.
 
-Large source archives must fit in Lambda ephemeral storage. Large replacement-expanded entries must fit in Lambda memory.
+Source archives up to 256 MiB must fit in Lambda memory. Larger or unknown-size source archives must fit in Lambda ephemeral storage. Large replacement-expanded entries and cached fallback entries must fit in Lambda memory.
+
+The default provider Lambda uses 1024 MiB memory. The current memory thresholds are budgeted as:
+
+```text
+peak ~= runtime reserve
+      + in-memory source zip
+      + parallel transfers * (stream chunk + fallback cache + SDK overhead)
+      + safety margin
+
+1024 MiB ~= 205 MiB
+         + 256 MiB
+         + 8 * (8 MiB + 32 MiB + 4 MiB)
+         + 128 MiB
+       = 941 MiB
+```
+
+Those numbers correspond to `DEFAULT_MEMORY_LIMIT_MB = 1024`, `MEMORY_ARCHIVE_THRESHOLD_BYTES = 256 MiB`, `MAX_PARALLEL_TRANSFERS = 8`, `ZIP_ENTRY_READ_CHUNK_BYTES = 8 MiB`, and `DECOMPRESSED_ENTRY_CACHE_THRESHOLD_BYTES = 32 MiB`. The reserve and SDK overhead are estimates, so these values are intentionally conservative rather than exact limits.
+
+`REMOTE_CHECKSUM_MIN_BYTES = 8 MiB` is a latency threshold rather than a memory threshold. Below it, the provider avoids checksum-mode `HeadObject` and computes MD5 locally; if S3 eventually returns actual CRC32 values from `ListObjectsV2`, this threshold should no longer be needed.
 
 This construct targets static asset deployment to S3. It is not a general-purpose sync engine and does not provide byte-range diffing, persistent manifests, or non-S3 backend behavior.
 

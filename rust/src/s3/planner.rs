@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek};
-use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use zip::ZipArchive;
@@ -60,19 +59,17 @@ pub(super) async fn plan_deployment(
 
     for source_index in 0..request.source_bucket_names.len() {
         if request.extract {
-            let archive_path = download_source_zip(
+            let archive = download_source_zip(
                 state,
                 &request.source_bucket_names[source_index],
                 &request.source_object_keys[source_index],
             )
             .await?;
             let archive_index = archives.len();
-            archives.push(SourceArchive {
-                path: Arc::new(archive_path),
-            });
+            archives.push(archive);
 
-            let mut zip = open_zip_archive(&archives[archive_index].path)
-                .context("failed to read zip archive")?;
+            let mut zip =
+                open_zip_archive(&archives[archive_index]).context("failed to read zip archive")?;
 
             add_archive_entries_to_manifest(
                 archive_index,

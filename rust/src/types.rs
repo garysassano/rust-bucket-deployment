@@ -118,18 +118,40 @@ pub(crate) enum PlannedAction {
 
 pub(crate) type DeploymentManifest = BTreeMap<String, PlannedObject>;
 
+#[derive(Clone)]
 pub(crate) struct SourceArchive {
-    pub(crate) path: Arc<PathBuf>,
+    pub(crate) data: Arc<SourceArchiveData>,
 }
 
-impl Drop for SourceArchive {
+pub(crate) enum SourceArchiveData {
+    InMemory(Arc<[u8]>),
+    TemporaryFile(PathBuf),
+}
+
+impl SourceArchive {
+    pub(crate) fn in_memory(bytes: Vec<u8>) -> Self {
+        Self {
+            data: Arc::new(SourceArchiveData::InMemory(Arc::from(bytes))),
+        }
+    }
+
+    pub(crate) fn temporary_file(path: PathBuf) -> Self {
+        Self {
+            data: Arc::new(SourceArchiveData::TemporaryFile(path)),
+        }
+    }
+}
+
+impl Drop for SourceArchiveData {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(self.path.as_ref()) {
-            tracing::warn!(
-                path = %self.path.display(),
-                error = %error,
-                "failed to remove temporary source archive"
-            );
+        if let SourceArchiveData::TemporaryFile(path) = self {
+            if let Err(error) = std::fs::remove_file(path.as_path()) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to remove temporary source archive"
+                );
+            }
         }
     }
 }
@@ -142,8 +164,6 @@ pub(crate) struct ResponsePayload {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::SourceArchive;
 
     #[test]
@@ -155,11 +175,27 @@ mod tests {
         ));
         std::fs::write(&path, b"temporary archive").unwrap();
 
-        let archive = SourceArchive {
-            path: Arc::new(path.clone()),
-        };
+        let archive = SourceArchive::temporary_file(path.clone());
         drop(archive);
 
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cloned_source_archive_removes_temporary_file_after_last_reference() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rust-bucket-deployment-drop-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"temporary archive").unwrap();
+
+        let archive = SourceArchive::temporary_file(path.clone());
+        let clone = archive.clone();
+        drop(archive);
+        assert!(path.exists());
+
+        drop(clone);
         assert!(!path.exists());
     }
 }

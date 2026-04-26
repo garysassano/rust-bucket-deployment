@@ -10,11 +10,14 @@ For `extract=true` sources without deploy-time markers, the source archive alrea
 - uncompressed size
 - zip entry CRC32
 
-The destination prefix is listed once with `ListObjectsV2`. The list response provides each object's key, size, `ETag`, checksum algorithms, and checksum type. When a destination object has the same size and advertises `CRC32` with `FULL_OBJECT`, the provider issues a targeted `HeadObject` with `ChecksumMode::Enabled` to read the actual `ChecksumCRC32` value. These checksum reads run inside the same bounded transfer task pool as fallback hashing and uploads.
+The destination prefix is listed once with `ListObjectsV2`. The list response provides each object's key, size, `ETag`, checksum algorithms, and checksum type, but not the actual checksum value. For entries at least 8 MiB, when a destination object has the same size and advertises `CRC32` with `FULL_OBJECT`, the provider issues a targeted `HeadObject` with `ChecksumMode::Enabled` to read the actual `ChecksumCRC32` value. These checksum reads run inside the same bounded transfer task pool as fallback hashing and uploads.
+
+Entries below 8 MiB skip the checksum-mode `HeadObject` and use the MD5/`ETag` fallback instead. The AWS benchmark showed that for small files the extra API round trip was more expensive than hashing local decompressed bytes, especially because the fallback cache can reuse those bytes for upload when changed. If S3 exposes actual CRC32 values directly from `ListObjectsV2` in the future, this threshold should be removed because the extra `HeadObject` cost would disappear.
 
 The provider skips a marker-free entry when:
 
 - destination size equals the zip entry uncompressed size
+- the entry is at least 8 MiB
 - destination checksum type is `FULL_OBJECT`
 - destination `ChecksumCRC32` equals the zip entry CRC32 encoded as base64 big-endian bytes
 

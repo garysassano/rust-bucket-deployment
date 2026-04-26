@@ -18,7 +18,7 @@ import { Construct } from "constructs";
 const CUSTOM_RESOURCE_OWNER_TAG = "aws-cdk:cr-owned";
 const HANDLER_BINARY_NAME = "rust-bucket-deployment-handler";
 const SHARED_HANDLER_ID_PREFIX = "RustBucketDeploymentHandler";
-const DEFAULT_MEMORY_LIMIT_MB = 256;
+const DEFAULT_MEMORY_LIMIT_MB = 1024;
 
 export interface RustBucketDeploymentProps
   extends Omit<

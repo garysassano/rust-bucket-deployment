@@ -99,4 +99,4 @@ Run date: 2026-04-26. Profile: `mixed`. Variant: `v1`. Bundle: 442 files, 52,904
 | `crc32` | 40.63 s | 3.00 s | 3.37 s | 100 MB |
 | `pre-crc32` | 55.85 s | 1.83 s | 1.81 s | 158 MB |
 
-On this mixed bundle, CRC32 improved cold-create provider duration and memory, but unchanged redeploys were slower than the MD5/ETag path. The likely reason is that the CRC32 path pays one checksum-mode `HeadObject` per unchanged object, while the old path hashes the local zip entries directly. This points toward a size threshold before using remote checksum reads.
+On this mixed bundle, CRC32 improved cold-create provider duration and memory, but unchanged redeploys were slower than the MD5/ETag path. The likely reason is that the CRC32 path pays one checksum-mode `HeadObject` per unchanged object, while the old path hashes the local zip entries directly. The implementation now uses `REMOTE_CHECKSUM_MIN_BYTES = 8 MiB` so smaller files use local MD5/ETag comparison instead of remote checksum reads.

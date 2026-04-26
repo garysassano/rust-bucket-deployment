@@ -12,6 +12,9 @@ mod transfer;
 pub(crate) use destination::{bucket_owned, delete_prefix};
 
 const MAX_PARALLEL_TRANSFERS: usize = 8;
+const MEMORY_ARCHIVE_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
+const DECOMPRESSED_ENTRY_CACHE_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+const REMOTE_CHECKSUM_MIN_BYTES: u64 = 8 * 1024 * 1024;
 const ZIP_ENTRY_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) async fn deploy(state: &AppState, request: &DeploymentRequest) -> Result<()> {

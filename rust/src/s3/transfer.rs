@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -21,7 +20,10 @@ use super::archive::{open_zip_archive, zip_entry_body};
 use super::destination::DestinationObject;
 use super::metadata::{apply_copy_metadata, apply_put_metadata};
 use super::planner::{CopyPlan, ZipEntryPlan};
-use super::{MAX_PARALLEL_TRANSFERS, ZIP_ENTRY_READ_CHUNK_BYTES};
+use super::{
+    DECOMPRESSED_ENTRY_CACHE_THRESHOLD_BYTES, MAX_PARALLEL_TRANSFERS, REMOTE_CHECKSUM_MIN_BYTES,
+    ZIP_ENTRY_READ_CHUNK_BYTES,
+};
 
 enum UploadPayload {
     Bytes {
@@ -29,7 +31,7 @@ enum UploadPayload {
         checksum_crc32: String,
     },
     ZipEntry {
-        archive_path: Arc<PathBuf>,
+        archive: SourceArchive,
         entry_index: usize,
         content_length: u64,
         checksum_crc32: String,
@@ -95,7 +97,7 @@ pub(super) async fn upload_zip_entries(
                 .acquire_owned()
                 .await
                 .context("failed to acquire upload semaphore")?;
-            let archive_path = archives[archive_index].path.clone();
+            let archive = archives[archive_index].clone();
             let state = state.clone();
             let metadata = metadata.clone();
             let destination_bucket = request.dest_bucket_name.clone();
@@ -108,7 +110,7 @@ pub(super) async fn upload_zip_entries(
                 let Some(payload) = prepare_zip_entry_upload(
                     &state,
                     &destination_bucket,
-                    &archive_path,
+                    &archive,
                     &plan,
                     &source_markers,
                     &source_marker_config,
@@ -137,7 +139,7 @@ pub(super) async fn upload_zip_entries(
 async fn prepare_zip_entry_upload(
     state: &AppState,
     destination_bucket: &str,
-    archive_path: &Arc<PathBuf>,
+    archive: &SourceArchive,
     plan: &ZipEntryPlan,
     source_markers: &HashMap<String, String>,
     source_marker_config: &MarkerConfig,
@@ -157,7 +159,7 @@ async fn prepare_zip_entry_upload(
             Some(true) => return Ok(None),
             Some(false) => {
                 return Ok(Some(UploadPayload::ZipEntry {
-                    archive_path: archive_path.clone(),
+                    archive: archive.clone(),
                     entry_index: plan.entry_index,
                     content_length: plan.size,
                     checksum_crc32: crc32_base64(plan.crc32),
@@ -167,10 +169,10 @@ async fn prepare_zip_entry_upload(
         }
     }
 
-    let mut zip = open_zip_archive(archive_path).context("failed to reopen zip archive")?;
+    let mut zip = open_zip_archive(archive).context("failed to reopen zip archive")?;
     let mut entry = zip.by_index(plan.entry_index)?;
     let prepared = prepare_zip_entry_for_comparison(
-        archive_path.clone(),
+        archive.clone(),
         &mut entry,
         source_markers,
         source_marker_config,
@@ -225,7 +227,7 @@ async fn copy_source_object(
 }
 
 fn prepare_zip_entry_for_comparison(
-    archive_path: Arc<PathBuf>,
+    archive: SourceArchive,
     entry: &mut zip::read::ZipFile<'_, impl Read + ?Sized>,
     source_markers: &HashMap<String, String>,
     source_marker_config: &MarkerConfig,
@@ -233,13 +235,27 @@ fn prepare_zip_entry_for_comparison(
 ) -> Result<PreparedUploadPayload> {
     if source_markers.is_empty() {
         let content_length = entry.size();
+        let checksum_crc32 = crc32_base64(entry.crc32());
+
+        if should_cache_decompressed_entry(content_length) {
+            let bytes = read_reader_to_vec(entry, content_length as usize)?;
+            let etag = md5_hex(&bytes);
+            return Ok(PreparedUploadPayload {
+                payload: UploadPayload::Bytes {
+                    bytes,
+                    checksum_crc32,
+                },
+                etag,
+            });
+        }
+
         let etag = hash_reader(entry)?;
         Ok(PreparedUploadPayload {
             payload: UploadPayload::ZipEntry {
-                archive_path,
+                archive,
                 entry_index,
                 content_length,
-                checksum_crc32: crc32_base64(entry.crc32()),
+                checksum_crc32,
             },
             etag,
         })
@@ -256,6 +272,14 @@ fn prepare_zip_entry_for_comparison(
             etag,
         })
     }
+}
+
+fn should_cache_decompressed_entry(content_length: u64) -> bool {
+    content_length <= DECOMPRESSED_ENTRY_CACHE_THRESHOLD_BYTES
+}
+
+fn should_read_remote_checksum(content_length: u64) -> bool {
+    content_length >= REMOTE_CHECKSUM_MIN_BYTES
 }
 
 async fn upload_payload(
@@ -280,13 +304,13 @@ async fn upload_payload(
             ByteStream::from(bytes)
         }
         UploadPayload::ZipEntry {
-            archive_path,
+            archive,
             entry_index,
             content_length,
             checksum_crc32,
         } => {
             builder = builder.checksum_crc32(checksum_crc32);
-            zip_entry_body(archive_path, entry_index, content_length)
+            zip_entry_body(archive, entry_index, content_length)
         }
     };
 
@@ -320,6 +344,10 @@ async fn marker_free_entry_matches_destination(
 
     if destination_object.size != Some(expected_size) {
         return Ok(Some(false));
+    }
+
+    if !should_read_remote_checksum(expected_size) {
+        return Ok(None);
     }
 
     if !destination_object.has_full_object_crc32 {
@@ -431,7 +459,19 @@ async fn join_transfer_tasks(mut tasks: JoinSet<Result<()>>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32_base64, crc32_bytes, hash_reader, md5_hex, read_reader_to_vec};
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::Write;
+
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    use crate::types::{MarkerConfig, SourceArchive};
+
+    use super::{
+        UploadPayload, crc32_base64, crc32_bytes, hash_reader, md5_hex,
+        prepare_zip_entry_for_comparison, read_reader_to_vec, should_cache_decompressed_entry,
+        should_read_remote_checksum,
+    };
 
     #[test]
     fn md5_hex_matches_known_digest() {
@@ -467,5 +507,72 @@ mod tests {
     #[test]
     fn crc32_bytes_matches_known_digest() {
         assert_eq!(crc32_bytes(b"hello"), 0x3610_a686);
+    }
+
+    #[test]
+    fn fallback_comparison_caches_small_marker_free_entry() {
+        let archive_path = write_test_zip(&[("asset.txt", b"cache me" as &[u8])]);
+        let archive = SourceArchive::temporary_file(archive_path);
+        let mut zip = super::open_zip_archive(&archive).unwrap();
+        let mut entry = zip.by_index(0).unwrap();
+
+        let prepared = prepare_zip_entry_for_comparison(
+            archive.clone(),
+            &mut entry,
+            &HashMap::new(),
+            &MarkerConfig::default(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.etag, md5_hex(b"cache me"));
+        match prepared.payload {
+            UploadPayload::Bytes {
+                bytes,
+                checksum_crc32,
+            } => {
+                assert_eq!(bytes, b"cache me");
+                assert_eq!(checksum_crc32, crc32_base64(crc32_bytes(b"cache me")));
+            }
+            UploadPayload::ZipEntry { .. } => panic!("small fallback entry should be cached"),
+        }
+    }
+
+    #[test]
+    fn decompressed_entry_cache_has_fixed_threshold() {
+        assert!(should_cache_decompressed_entry(
+            super::DECOMPRESSED_ENTRY_CACHE_THRESHOLD_BYTES
+        ));
+        assert!(!should_cache_decompressed_entry(
+            super::DECOMPRESSED_ENTRY_CACHE_THRESHOLD_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn remote_checksum_reads_have_minimum_size_threshold() {
+        assert!(!should_read_remote_checksum(
+            super::REMOTE_CHECKSUM_MIN_BYTES - 1
+        ));
+        assert!(should_read_remote_checksum(
+            super::REMOTE_CHECKSUM_MIN_BYTES
+        ));
+    }
+
+    fn write_test_zip(entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rust-bucket-deployment-transfer-test-{}.zip",
+            uuid::Uuid::new_v4()
+        ));
+
+        let file = File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        for (name, body) in entries {
+            zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+
+        path
     }
 }
